@@ -1,8 +1,18 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import datetime
 import random
 import hashlib
 from typing import List, Dict
+
+# Optional offline English word validation
+try:
+    from wordfreq import zipf_frequency  # type: ignore
+    WORDFREQ_AVAILABLE = True
+except Exception:
+    WORDFREQ_AVAILABLE = False
+    zipf_frequency = None  # type: ignore
+
 
 # -----------------------------
 # Page config
@@ -98,6 +108,10 @@ st.markdown(
         font-size: 34px !important;
         font-weight: 900 !important;
     }
+
+    /* Hide the keyboard bridge widgets */
+    .kbd-bridge [data-testid="stTextInput"] { display:none !important; height:0 !important; }
+    .kbd-bridge [data-testid="stButton"] { display:none !important; height:0 !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -133,7 +147,6 @@ def stable_daily_index(seed: str, n: int) -> int:
 
 
 def evaluate_guess(guess: str, answer: str) -> List[str]:
-    """Wordle evaluation with correct duplicate handling."""
     guess = guess.upper()
     answer = answer.upper()
 
@@ -176,8 +189,17 @@ def tile_color(status: str) -> str:
     return "rgba(255,255,255,0.95)"
 
 
+def key_color(status: str) -> str:
+    if status == "correct":
+        return "#6AAA64"
+    if status == "present":
+        return "#C9B458"
+    if status == "absent":
+        return "#787C7E"
+    return "#E6E8EB"
+
+
 def render_board(guesses: List[str], feedback: List[List[str]], current: str, game_over: bool):
-    """Always render as HTML (never as raw text)."""
     rows_html = []
     for r in range(MAX_GUESSES):
         if r < len(guesses):
@@ -205,8 +227,7 @@ def render_board(guesses: List[str], feedback: List[List[str]], current: str, ga
             tiles = ['<div class="tile"></div>' for _ in range(WORD_LENGTH)]
             rows_html.append(f'<div class="row">{"".join(tiles)}</div>')
 
-    html = f'<div class="board">{"".join(rows_html)}</div>'
-    st.markdown(html, unsafe_allow_html=True)
+    st.markdown(f'<div class="board">{"".join(rows_html)}</div>', unsafe_allow_html=True)
 
 
 def share_grid(feedback: List[List[str]]) -> str:
@@ -222,6 +243,17 @@ def share_grid(feedback: List[List[str]]) -> str:
                 s += "⬛"
         lines.append(s)
     return "\n".join(lines)
+
+
+def is_english_word(guess: str) -> bool:
+    g = guess.lower()
+    if not g.isalpha() or len(g) != WORD_LENGTH:
+        return False
+
+    if WORDFREQ_AVAILABLE:
+        return zipf_frequency(g, "en") >= 2.0
+
+    return g.upper() in VALID_GUESSES
 
 
 def wkey(name: str) -> str:
@@ -251,7 +283,13 @@ def init_wordle_state():
     if wkey("error") not in st.session_state:
         st.session_state[wkey("error")] = ""
     if wkey("strict") not in st.session_state:
-        st.session_state[wkey("strict")] = False
+        st.session_state[wkey("strict")] = True
+
+    # keyboard bridge (NON-widget keys only)
+    if wkey("kb_last_nonce") not in st.session_state:
+        st.session_state[wkey("kb_last_nonce")] = ""
+    if wkey("kb_reset_nonce") not in st.session_state:
+        st.session_state[wkey("kb_reset_nonce")] = 0
 
 
 def reset_wordle(random_word: bool):
@@ -269,12 +307,15 @@ def reset_wordle(random_word: bool):
     st.session_state[wkey("error")] = ""
     st.session_state[wkey("text_rev")] += 1
 
+    # Invalidate any in-flight keyboard events without touching widget keys
+    st.session_state[wkey("kb_last_nonce")] = ""
+    st.session_state[wkey("kb_reset_nonce")] += 1
+
 
 def wordle_commit_guess():
     if st.session_state[wkey("game_over")]:
         return
 
-    strict = st.session_state[wkey("strict")]
     guess = st.session_state[wkey("current")].upper().strip()
 
     if len(guess) != WORD_LENGTH:
@@ -283,8 +324,12 @@ def wordle_commit_guess():
     if not guess.isalpha():
         st.session_state[wkey("error")] = "Only letters A–Z."
         return
-    if strict and guess not in VALID_GUESSES:
-        st.session_state[wkey("error")] = "Not in word list (strict mode)."
+
+    if st.session_state[wkey("strict")] and not is_english_word(guess):
+        if WORDFREQ_AVAILABLE:
+            st.session_state[wkey("error")] = "Not a valid English word."
+        else:
+            st.session_state[wkey("error")] = "Install wordfreq to validate English words (pip install wordfreq)."
         return
 
     st.session_state[wkey("error")] = ""
@@ -297,7 +342,6 @@ def wordle_commit_guess():
         st.session_state[wkey("key_status")], guess, statuses
     )
 
-    # lock the row by clearing current immediately
     st.session_state[wkey("current")] = ""
     st.session_state[wkey("text_rev")] += 1
 
@@ -328,15 +372,133 @@ def wordle_handle_keypress(key: str):
             st.session_state[wkey("text_rev")] += 1
 
 
-def render_wordle_keyboard_immediate():
+def render_colored_keyboard_html(key_status: Dict[str, str], disabled: bool, reset_nonce: int):
+    """
+    Nice HTML keyboard, no query params.
+    Sends KEY|NONCE|RESETNONCE into a hidden text input, then clicks hidden button.
+    """
+    def status_for(k: str) -> str:
+        if len(k) == 1 and k.isalpha():
+            return key_status.get(k.upper(), "unused")
+        return "unused"
+
+    rows_html = []
     for row in KEY_ROWS:
-        weights = [1.6 if k in ("ENTER", "⌫") else 1.0 for k in row]
-        cols = st.columns(weights)
-        for i, key in enumerate(row):
-            label = "Enter" if key == "ENTER" else ("⌫" if key == "⌫" else key)
-            if cols[i].button(label, key=f"{wkey('kbd')}::{key}", disabled=st.session_state[wkey("game_over")]):
-                wordle_handle_keypress(key)
-                st.rerun()
+        keys_html = []
+        for k in row:
+            stt = status_for(k)
+            bg = key_color(stt)
+            fg = "#ffffff" if stt in ("correct", "present", "absent") else "#111111"
+
+            if k == "ENTER":
+                w = "84px"
+                label = "Enter"
+            elif k == "⌫":
+                w = "60px"
+                label = "⌫"
+            else:
+                w = "44px"
+                label = k
+
+            op = "0.55" if disabled else "1.0"
+            cursor = "not-allowed" if disabled else "pointer"
+
+            keys_html.append(
+                f"""
+                <button class="kbkey"
+                        style="width:{w}; background:{bg}; color:{fg}; opacity:{op}; cursor:{cursor};"
+                        onclick="sendKey('{k}')"
+                        {"disabled" if disabled else ""}>
+                    {label}
+                </button>
+                """
+            )
+        rows_html.append(f"""<div class="kbrow">{''.join(keys_html)}</div>""")
+
+    html = f"""
+    <div class="kbwrap">
+      {''.join(rows_html)}
+    </div>
+
+    <script>
+      function sendKey(k) {{
+        const disabled = {str(disabled).lower()};
+        if (disabled) return;
+
+        const nonce = String(Date.now()) + "_" + Math.floor(Math.random()*1000000);
+        const payload = k + "|" + nonce + "|" + String({reset_nonce});
+
+        const bridge = window.parent.document.querySelector(".kbd-bridge");
+        const tinp = bridge ? bridge.querySelector("input") : null;
+        if (!tinp) return;
+
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeSetter.call(tinp, payload);
+        tinp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+
+        const btn = bridge.querySelector("button");
+        if (btn) btn.click();
+      }}
+    </script>
+
+    <style>
+      .kbwrap {{
+        display:flex;
+        flex-direction:column;
+        gap: 6px;
+        margin-top: 10px;
+        margin-bottom: 6px;
+      }}
+      .kbrow {{
+        display:flex;
+        justify-content:center;
+        gap: 4px;
+      }}
+      .kbkey {{
+        height: 46px;
+        border: 1px solid rgba(0,0,0,0.12);
+        border-radius: 12px;
+        font-weight: 900;
+        font-size: 14px;
+        user-select:none;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+      }}
+      .kbkey:active {{
+        transform: translateY(1px);
+      }}
+    </style>
+    """
+
+    components.html(html, height=190)
+
+
+def consume_keyboard_bridge():
+    """
+    Reads payload from hidden widget key wordle::kb_value, but NEVER writes to it.
+    Payload format: KEY|NONCE|RESETNONCE
+    """
+    raw = st.session_state.get(wkey("kb_value"), "") or ""
+    if raw.count("|") < 2:
+        return
+
+    key, nonce, rnonce_str = raw.split("|", 2)
+
+    # Ignore events from before the last reset
+    try:
+        rnonce = int(rnonce_str)
+    except Exception:
+        return
+
+    if rnonce != st.session_state.get(wkey("kb_reset_nonce"), 0):
+        return
+
+    # Ignore duplicate replays
+    last = st.session_state.get(wkey("kb_last_nonce"), "")
+    if nonce == last:
+        return
+
+    st.session_state[wkey("kb_last_nonce")] = nonce
+    wordle_handle_keypress(key)
 
 
 # =============================
@@ -454,8 +616,17 @@ tab_wordle, tab_ttt, tab_num = st.tabs(["🟩 Word Guess", "❌⭕ Tic-Tac-Toe",
 with tab_wordle:
     init_wordle_state()
 
+    # Hidden bridge widgets for the HTML keyboard (widget keys exist, but we never set them in Python)
+    st.markdown('<div class="kbd-bridge">', unsafe_allow_html=True)
+    st.text_input("kbd_bridge_value", key=wkey("kb_value"), label_visibility="collapsed")
+    st.button("kbd_bridge_btn", key=wkey("kb_btn"))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Consume keypress event (if any)
+    consume_keyboard_bridge()
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns([2.0, 1.2, 1.1, 1.1], vertical_alignment="center")
+    c1, c2, c3, c4 = st.columns([2.0, 1.2, 1.2, 1.0], vertical_alignment="center")
 
     with c1:
         st.subheader("🟩 Word Guess")
@@ -472,37 +643,34 @@ with tab_wordle:
 
     with c3:
         st.session_state[wkey("strict")] = st.toggle(
-            "Strict list", value=st.session_state[wkey("strict")]
+            "English words only", value=st.session_state[wkey("strict")]
         )
+        if st.session_state[wkey("strict")] and not WORDFREQ_AVAILABLE:
+            st.caption("Tip: install wordfreq for best validation.")
 
     with c4:
         if st.button("New", use_container_width=True):
             reset_wordle(random_word=(mode == "Random"))
             st.rerun()
 
-    # Render board in a stable container (always HTML)
-    board_box = st.container()
-    with board_box:
-        render_board(
-            st.session_state[wkey("guesses")],
-            st.session_state[wkey("feedback")],
-            st.session_state[wkey("current")],
-            st.session_state[wkey("game_over")],
-        )
+    render_board(
+        st.session_state[wkey("guesses")],
+        st.session_state[wkey("feedback")],
+        st.session_state[wkey("current")],
+        st.session_state[wkey("game_over")],
+    )
 
-    # Text input (key-swap pattern so it refreshes after on-screen keyboard presses)
+    # Visible typing input using key-swap (clears on reset without illegal session_state writes)
     rev = st.session_state[wkey("text_rev")]
-    text_key = f"{wkey('typed')}::{rev}"
     typed = st.text_input(
         "Type a guess",
         value=st.session_state[wkey("current")],
-        key=text_key,
+        key=f"{wkey('typed')}::{rev}",
         max_chars=WORD_LENGTH,
         placeholder="Type 5 letters…",
         label_visibility="collapsed",
         disabled=st.session_state[wkey("game_over")],
     )
-
     typed_up = (typed or "").upper()[:WORD_LENGTH]
     if typed_up != st.session_state[wkey("current")]:
         st.session_state[wkey("current")] = typed_up
@@ -527,7 +695,12 @@ with tab_wordle:
             st.session_state[wkey("text_rev")] += 1
             st.rerun()
 
-    render_wordle_keyboard_immediate()
+    # Nice keyboard (colored keys) using reset_nonce to ignore stale clicks
+    render_colored_keyboard_html(
+        st.session_state[wkey("key_status")],
+        disabled=st.session_state[wkey("game_over")],
+        reset_nonce=st.session_state[wkey("kb_reset_nonce")],
+    )
 
     st.markdown("---")
     if st.session_state[wkey("game_over")]:
@@ -612,6 +785,8 @@ with tab_num:
 
 with st.sidebar:
     st.markdown("### 🎛️ Arcade Settings")
+    if not WORDFREQ_AVAILABLE:
+        st.caption("For English-word validation: `pip install wordfreq`")
     st.caption("Add new tabs for more games anytime.")
     st.divider()
     st.caption("Made with Streamlit ✨")
